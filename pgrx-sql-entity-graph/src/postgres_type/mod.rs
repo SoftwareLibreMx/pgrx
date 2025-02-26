@@ -23,6 +23,7 @@ use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::{DeriveInput, Generics, ItemStruct, Lifetime, LifetimeParam};
 
+pub use crate::postgres_type::entity::Alignment;
 use crate::{CodeEnrichment, ToSqlConfig};
 
 /// A parsed `#[derive(PostgresType)]` item.
@@ -56,6 +57,7 @@ pub struct PostgresTypeDerive {
     out_fn: Ident,
     typmod_in_fn: Ident,
     to_sql_config: ToSqlConfig,
+    alignment: Alignment,
 }
 
 impl PostgresTypeDerive {
@@ -66,11 +68,12 @@ impl PostgresTypeDerive {
         out_fn: Ident,
         typmod_in_fn: Ident,
         to_sql_config: ToSqlConfig,
+        alignment: Alignment,
     ) -> Result<CodeEnrichment<Self>, syn::Error> {
         if !to_sql_config.overrides_default() {
             crate::ident_is_acceptable_to_postgres(&name)?;
         }
-        Ok(CodeEnrichment(Self { generics, name, in_fn, out_fn, typmod_in_fn, to_sql_config }))
+        Ok(CodeEnrichment(Self { generics, name, in_fn, out_fn, typmod_in_fn, to_sql_config, alignment }))
     }
 
     pub fn from_derive_input(
@@ -96,6 +99,7 @@ impl PostgresTypeDerive {
             &format!("{}_typmod_in", derive_input.ident).to_lowercase(),
             derive_input.ident.span(),
         );
+        let alignment = Alignment::from_attributes(derive_input.attrs.as_slice())?;
         Self::new(
             derive_input.ident,
             derive_input.generics,
@@ -103,6 +107,7 @@ impl PostgresTypeDerive {
             funcname_out,
             funcname_typmod_in,
             to_sql_config,
+            alignment,
         )
     }
 }
@@ -136,6 +141,11 @@ impl ToEntityGraphTokens for PostgresTypeDerive {
         let sql_graph_entity_fn_name = format_ident!("__pgrx_internals_type_{}", self.name);
 
         let to_sql_config = &self.to_sql_config;
+
+        let alignment = match &self.alignment {
+            Alignment::On => quote! { Some(::std::mem::align_of::<#name>()) },
+            Alignment::Off => quote! { None },
+        };
 
         quote! {
             unsafe impl #impl_generics ::pgrx::pgrx_sql_entity_graph::metadata::SqlTranslatable for #name #ty_generics #where_clauses {
@@ -205,6 +215,7 @@ impl ToEntityGraphTokens for PostgresTypeDerive {
                         path_items.join("::")
                     },
                     to_sql_config: #to_sql_config,
+                    alignment: #alignment,
                 };
                 ::pgrx::pgrx_sql_entity_graph::SqlGraphEntity::Type(submission)
             }
@@ -221,6 +232,7 @@ impl Parse for CodeEnrichment<PostgresTypeDerive> {
         let in_fn = Ident::new(&format!("{}_in", ident).to_lowercase(), ident.span());
         let out_fn = Ident::new(&format!("{}_out", ident).to_lowercase(), ident.span());
         let typmod_in_fn = Ident::new(&format!("{}_typmod_in", ident).to_lowercase(), ident.span());
-        PostgresTypeDerive::new(ident, generics, in_fn, out_fn, typmod_in_fn, to_sql_config)
+        let alignment = Alignment::from_attributes(attrs.as_slice())?;
+        PostgresTypeDerive::new(ident, generics, in_fn, out_fn, typmod_in_fn, to_sql_config, alignment)
     }
 }
