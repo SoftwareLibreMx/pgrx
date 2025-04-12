@@ -20,15 +20,15 @@ use std::os::raw::c_char;
 macro_rules! pgstat_count_impl {
     ($name:ident, $new_field:ident, $old_field:ident) => {
         pub fn $name(&mut self) {
-            let info = self.pgstat_info;
-            unsafe {
+            if self.should_count_relation() {
+                let info = self.pgstat_info;
+
                 #[cfg(any(feature = "pg16", feature = "pg17"))]
-                if self.should_count_relation() {
+                unsafe {
                     (*info).counts.$new_field += 1;
                 }
-
                 #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
-                if self.should_count_relation() {
+                unsafe {
                     (*info).t_counts.$old_field += 1;
                 }
             }
@@ -335,16 +335,18 @@ impl PgRelation {
     pgstat_count_impl!(count_buffer_read, blocks_fetched, t_blocks_fetched);
     pgstat_count_impl!(count_buffer_hit, blocks_hit, t_blocks_hit);
 
-    pub fn count_index_tuples(&mut self, n: i64) {
-        let info = self.pgstat_info;
-        unsafe {
+    pub fn count_index_tuples(
+        &mut self,
+        n: i64,
+    ) {
+        if self.should_count_relation() {
+            let info = self.pgstat_info;
             #[cfg(any(feature = "pg16", feature = "pg17"))]
-            if self.should_count_relation() {
+            unsafe {
                 (*info).counts.tuples_returned += n;
             }
-
             #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
-            if self.should_count_relation() {
+            unsafe {
                 (*info).t_counts.t_tuples_returned += n;
             }
         }
