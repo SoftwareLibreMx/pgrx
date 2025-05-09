@@ -74,51 +74,73 @@ pub(crate) struct Regress {
 }
 
 impl Regress {
+    #[rustfmt::skip]
+    fn is_setup_sql_newer(&self, manifest_path: impl AsRef<Path>) -> bool {
+        let sql = manifest_path_to_sql_tests_path(&manifest_path);
+        if !sql.exists() { return false; }
+        let expected = manifest_path_to_expected_tests_output_path(&manifest_path);
+        if !expected.exists() {return false; }
+
+        let setup_sql = sql.join("setup.sql");
+        let setup_out = expected.join("setup.out");
+
+        let Ok(setup_sql) = std::fs::metadata(setup_sql) else { return false; };
+        let Ok(setup_out) = std::fs::metadata(setup_out) else { return true; }; // there is no output file, so setup.sql is definitely newer 
+
+        let Ok(sql_modified) = setup_sql.modified() else { return false; };
+        let Ok(out_modified) = setup_out.modified() else { return false; };
+
+        sql_modified > out_modified
+    }
+
     fn list_sql_tests(
         &self,
         manifest_path: impl AsRef<Path>,
-    ) -> eyre::Result<(Vec<DirEntry>, Option<DirEntry>)> {
+        include_setup: bool,
+    ) -> eyre::Result<Vec<DirEntry>> {
         let sql = manifest_path_to_sql_tests_path(manifest_path);
         if !sql.exists() {
             std::fs::create_dir(&sql)?;
         }
         let mut files = std::fs::read_dir(sql)?.collect::<Result<Vec<_>, _>>()?;
 
-        let setup_file = Self::organize_files(&mut files, "sql");
-        Ok((files, setup_file))
+        Self::organize_files(&mut files, "sql", include_setup);
+        Ok(files)
     }
 
     fn list_expected_outputs(
         &self,
         manifest_path: impl AsRef<Path>,
-    ) -> eyre::Result<(Vec<DirEntry>, Option<DirEntry>)> {
+        include_setup: bool,
+    ) -> eyre::Result<Vec<DirEntry>> {
         let expected = manifest_path_to_expected_tests_output_path(manifest_path);
         if !expected.exists() {
             std::fs::create_dir(&expected)?;
         }
         let mut files = std::fs::read_dir(expected)?.collect::<Result<Vec<_>, _>>()?;
 
-        let setup_file = Self::organize_files(&mut files, "out");
+        Self::organize_files(&mut files, "out", include_setup);
 
-        Ok((files, setup_file))
+        Ok(files)
     }
 
     fn list_results_outputs(
         &self,
         manifest_path: impl AsRef<Path>,
-    ) -> eyre::Result<(Vec<DirEntry>, Option<DirEntry>)> {
+        include_setup: bool,
+    ) -> eyre::Result<Vec<DirEntry>> {
         let results = manifest_path_to_results_output_path(manifest_path);
         if !results.exists() {
             std::fs::create_dir(&results)?;
         }
         let mut files = std::fs::read_dir(results)?.collect::<Result<Vec<_>, _>>()?;
 
-        let setup_file = Self::organize_files(&mut files, "out");
+        Self::organize_files(&mut files, "out", include_setup);
 
-        Ok((files, setup_file))
+        Ok(files)
     }
 
-    fn organize_files(files: &mut Vec<DirEntry>, only: &str) -> Option<DirEntry> {
+    fn organize_files(files: &mut Vec<DirEntry>, only: &str, include_setup: bool) {
         // remove any files that don't have `only` as the extension
         files.retain(|entry| {
             entry
@@ -144,13 +166,19 @@ impl Regress {
             false
         };
 
+        // remove the "setup" file from the list
         let setup_entry =
             files.iter().position(|entry| is_setup(entry)).map(|idx| files.remove(idx));
 
         // not all filesystems list directories sorted and we want some kind of guaranteed evaluation order
         files.sort_unstable_by_key(|entry| entry.file_name());
 
-        setup_entry
+        // if we detected a setup file and the caller wants to include it, make it the first entry
+        if let Some(setup_entry) = setup_entry {
+            if include_setup {
+                files.insert(0, setup_entry);
+            }
+        }
     }
 
     fn accept_new_test(
@@ -189,7 +217,7 @@ impl Regress {
             std::io::stdin().read_line(&mut user_input)?;
             let user_input = user_input.trim();
 
-            if user_input == "Y" || user_input == "y" {
+            if user_input == "Y" || user_input == "y" || user_input.is_empty() {
                 variant_suffix = None
             } else if user_input.as_bytes()[0] >= b'0' && user_input.as_bytes()[0] <= b'9' {
                 // currently secret options to create a variant file
@@ -203,14 +231,27 @@ impl Regress {
         let expected_path = manifest_path_to_expected_tests_output_path(manifest_path)
             .join(&format!("{test_name}{}.out", variant_suffix.unwrap_or_default()));
 
-        println!(
-            "{} test output to {}",
-            "     Copying".bold().green(),
-            expected_path.display().bold().cyan()
-        );
-        std::fs::copy(test_result_output, &expected_path)?;
+        if expected_path.exists() {
+            println!(
+                "{} test output to {}",
+                "   Replacing".bold().green(),
+                expected_path.display().bold().cyan()
+            );
+            std::fs::copy(test_result_output, &expected_path)?;
 
-        add_to_git(expected_path)
+            // don't "git add" the file if it already exists
+            Ok(())
+        } else {
+            println!(
+                "{} test output to {}",
+                "     Copying".bold().green(),
+                expected_path.display().bold().cyan()
+            );
+            std::fs::copy(test_result_output, &expected_path)?;
+
+            // make sure to add the file to git
+            add_to_git(expected_path)
+        }
     }
 
     fn run_all_tests(
@@ -221,6 +262,7 @@ impl Regress {
         dbname: &str,
         test_files: &[&DirEntry],
         output_files: &[&DirEntry],
+        include_setup: bool,
         auto: bool,
     ) -> eyre::Result<()> {
         let output_names = output_files.iter().map(|e| make_test_name(*e)).collect::<HashSet<_>>();
@@ -237,7 +279,7 @@ impl Regress {
         if !new_tests.is_empty() {
             println!(
                 "{} {} new tests, running each individually to create output",
-                "       Found".bold().cyan(),
+                "       Found".bold().green(),
                 new_tests.len()
             );
             for new_test in new_tests {
@@ -258,7 +300,7 @@ impl Regress {
 
         if !success && auto {
             // tests failed, but the user asked to `auto`matically accept their output as new output
-            let (results_files, _) = self.list_results_outputs(&manifest_path)?;
+            let results_files = self.list_results_outputs(&manifest_path, include_setup)?;
 
             println!();
             for entry in results_files {
@@ -267,12 +309,20 @@ impl Regress {
                 let expected_path =
                     manifest_path_to_expected_tests_output_path(&manifest_path).join(filename);
 
+                if !expected_path.exists() {
+                    // this is a file from `results/test-name.out` for which we don't have an expected file
+                    // we can ignore it
+                    continue;
+                }
+
                 let src = std::fs::read_to_string(entry.path())?;
                 let dst = std::fs::read_to_string(&expected_path)?;
                 if src != dst {
                     println!(
-                        "test `{}` failed, automatically promoting its output as",
-                        make_test_name(&entry).bold().bright_red()
+                        "{} {}'s output to {}",
+                        "   Promoting".bold().yellow(),
+                        make_test_name(&entry).bold().bright_red(),
+                        expected_path.display().bold().cyan()
                     );
                     std::fs::copy(entry.path(), &expected_path)?;
                 }
@@ -288,6 +338,9 @@ impl Regress {
 impl CommandExecute for Regress {
     #[tracing::instrument(level = "error", skip(self))]
     fn execute(mut self) -> eyre::Result<()> {
+        unsafe {
+            std::env::set_var("PGRX_REGRESS_TESTING", "1");
+        }
         let (_, manifest_path) = get_package_manifest(
             &self.features,
             self.package.as_ref(),
@@ -305,49 +358,29 @@ impl CommandExecute for Regress {
         let (pg_config, dbname) = Run::from(&self).install(false, &postgresql_conf)?;
         let pgregress_path = pg_config.pg_regress_path()?;
 
-        // figure out what test and output files we have
-        let (mut test_files, setup_file) = self.list_sql_tests(&manifest_path)?;
-        let (output_files, setup_output) = self.list_expected_outputs(&manifest_path)?;
+        if self.is_setup_sql_newer(&manifest_path) {
+            println!(
+                "{} database {} to be (re)created as `setup.sql` is newer than its expected output",
+                "     Forcing".bold().yellow(),
+                dbname.cyan()
+            );
+        }
 
         // NB:  the `is_test` argument for both `dropdb()` and `createdb()` is for `cargo pgrx test`,
         // which creates its own Postgres instance and has its own port and datadir and such, so we
         // say `false` here.
-        if self.resetdb {
+        if self.resetdb || self.is_setup_sql_newer(&manifest_path) {
             dropdb(&pg_config, &dbname, false, self.runas.clone())?;
         }
         // won't re-create it if it already exists
         let created_db = createdb(&pg_config, &dbname, false, true, self.runas.clone())?;
         if !created_db {
             println!("{} existing database {dbname}", "    Re-using".bold().cyan());
-        } else {
-            match (setup_file, setup_output) {
-                // there is no setup test
-                (None, _) => {}
-
-                // run the setup test, comparing its result to its output
-                (Some(setup_file), Some(_)) => {
-                    let success = run_tests(&pg_config, &pgregress_path, &dbname, &[&setup_file])?;
-
-                    if !success {
-                        panic!("the `{}` test failed", "setup".bold().bright_red());
-                    }
-                }
-
-                // create the output for the setup test
-                (Some(setup_file), None) => {
-                    if let Some(test_result_output) = create_regress_output(
-                        &pg_config,
-                        &manifest_path,
-                        &pgregress_path,
-                        &dbname,
-                        &setup_file,
-                    )? {
-                        // and ask the user if it's good
-                        self.accept_new_test(&manifest_path, test_result_output, self.auto)?;
-                    }
-                }
-            }
         }
+
+        // figure out what test and output files we have
+        let mut test_files = self.list_sql_tests(&manifest_path, created_db)?;
+        let output_files = self.list_expected_outputs(&manifest_path, created_db)?;
 
         // filter tests
         if let Some(test_filter) = self.test_filter.as_ref() {
@@ -361,6 +394,8 @@ impl CommandExecute for Regress {
             }
         }
 
+        println!();
+        println!("--- beginning regression test run ---");
         self.run_all_tests(
             &pg_config,
             &manifest_path,
@@ -368,6 +403,7 @@ impl CommandExecute for Regress {
             &dbname,
             &test_files.iter().collect::<Vec<_>>(),
             &output_files.iter().collect::<Vec<_>>(),
+            created_db, // include_setup
             self.auto,
         )
     }
@@ -510,42 +546,78 @@ fn pg_regress(
 
 fn decorate_output(input: &str) -> String {
     let mut decorated = String::with_capacity(input.len());
-    for mut line in input.lines() {
-        let mut is_test_line = false;
+    let (mut total_passed, mut total_failed) = (0, 0);
+    for line in input.lines() {
+        let mut line = line.to_string();
+        let mut is_old_line = false;
+        let mut is_new_line = false;
+
         if line.starts_with("ok") {
-            line = line.trim_start_matches("ok");
-            decorated.push_str(&format!("{}", "PASS ".bold().bright_green()));
-            is_test_line = true;
+            // for pg_regress from pg16 forward, rewrite the "ok" into a colored PASS"
+            is_new_line = true;
         } else if line.starts_with("not ok") {
-            line = line.trim_start_matches("not ok");
-            decorated.push_str(&format!("{}", "FAIL ".bold().bright_red()));
-            is_test_line = true;
+            // for pg_regress from pg16 forward, rewrite the "no ok" into a colored FAIL"
+            line = line.replace("not ok", "not_ok"); // to make parsing easier down below
+            is_new_line = true;
+        } else if line.contains("... ok") {
+            is_old_line = true;
+        } else if line.contains("... FAILED") {
+            is_old_line = true;
         }
 
-        if is_test_line {
-            fn split_line(line: &str) -> Option<(&str, &str, &str, &str)> {
+        let parsed_test_line = if is_new_line {
+            fn split_line(line: &str) -> Option<(&str, bool, &str, &str)> {
                 let mut parts = line.split_whitespace();
 
-                let num = parts.next()?;
+                let passed = parts.next()? == "ok";
+                parts.next()?; // throw away the test number
                 parts.next()?; // throw away the dash (-)
                 let test_name = parts.next()?;
                 let execution_time = parts.next()?;
                 let execution_units = parts.next()?;
-                Some((num, test_name, execution_time, execution_units))
+                Some((test_name, passed, execution_time, execution_units))
+            }
+            split_line(&line)
+        } else if is_old_line {
+            fn split_line(line: &str) -> Option<(&str, bool, &str, &str)> {
+                let mut parts = line.split_whitespace();
+
+                parts.next()?; // throw away "test"
+                let test_name = parts.next()?;
+                parts.next()?; // throw away "..."
+                let passed = parts.next()? == "ok";
+                let execution_time = parts.next()?;
+                let execution_units = parts.next()?;
+                Some((test_name, passed, execution_time, execution_units))
+            }
+            split_line(&line)
+        } else {
+            // not a line we care about
+            continue;
+        };
+
+        if let Some((test_name, passed, execution_time, execution_units)) = parsed_test_line {
+            if passed {
+                total_passed += 1
+            } else {
+                total_failed += 1
             }
 
-            if let Some((num, test_name, execution_time, execution_units)) = split_line(line) {
-                decorated.push_str(&format!("#{num} {test_name} {execution_time}{execution_units}"))
-            } else {
-                decorated.push_str(line);
-            }
-        } else {
-            let line = line.replace("... FAILED", &"... FAILED".bold().bright_red().to_string());
-            let line = line.replace("... ok", &"... ok".bold().bright_green().to_string());
-            decorated.push_str(&line);
+            decorated.push_str(&format!(
+                "{} {test_name} {execution_time}{execution_units}\n",
+                if passed {
+                    "PASS".bold().bright_green().to_string()
+                } else {
+                    "FAIL".bold().bright_red().to_string()
+                }
+            ))
         }
-        decorated.push('\n');
     }
+
+    if total_passed + total_failed > 0 {
+        decorated.push_str(&format!("passed={total_passed}, failed={total_failed}\n"))
+    }
+
     decorated
 }
 
